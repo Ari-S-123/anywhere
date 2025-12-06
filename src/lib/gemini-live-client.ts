@@ -291,11 +291,14 @@ export class GeminiLiveClient {
 
       // Send function response back to the model if we have an ID
       if (id && this.session) {
+        const responsePayload = this.normalizeFunctionResponsePayload(result);
+
         await this.session.sendToolResponse({
           functionResponses: [
             {
               id,
-              response: { result: JSON.stringify(result) }
+              name,
+              response: responsePayload
             }
           ]
         });
@@ -309,11 +312,9 @@ export class GeminiLiveClient {
           functionResponses: [
             {
               id,
+              name,
               response: {
-                result: JSON.stringify({
-                  success: false,
-                  error: error instanceof Error ? error.message : "Unknown error"
-                })
+                error: error instanceof Error ? error.message : "Unknown error"
               }
             }
           ]
@@ -473,6 +474,33 @@ ${context.address ? `- Address: ${context.address}` : "- Address: Unknown"}`;
     // Send an empty realtime input to signal interruption
     await this.session.sendRealtimeInput({});
     this.state.isSpeaking = false;
+  }
+
+  /**
+   * Normalizes arbitrary function results into a JSON-serializable payload
+   * suitable for Live API tool responses.
+   *
+   * @param result - Raw result returned by the navigation handler
+   * @returns Plain object that can be safely sent back to Gemini
+   */
+  private normalizeFunctionResponsePayload(result: unknown): Record<string, unknown> {
+    if (result === undefined || result === null) {
+      return {};
+    }
+
+    if (typeof result === "object") {
+      try {
+        return JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
+      } catch (serializationError) {
+        console.warn(
+          "[GeminiLive] Failed to serialize function result, returning stringified output",
+          serializationError
+        );
+        return { output: String(result) };
+      }
+    }
+
+    return { output: result };
   }
 
   /**

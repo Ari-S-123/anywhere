@@ -68,6 +68,12 @@ export class AudioHandler {
   /** Configuration options */
   private config: InternalConfig;
 
+  /** Blob URL for the AudioWorklet processor. Shared across instances to avoid re-creation. */
+  private static workletModuleUrl: string | undefined;
+
+  /** Tracks contexts that already loaded the worklet module to prevent duplicate registrations. */
+  private static registeredCaptureContexts: WeakSet<AudioContext> = new WeakSet();
+
   /** AudioContext for capture operations */
   private captureContext: AudioContext | undefined;
 
@@ -77,8 +83,11 @@ export class AudioHandler {
   /** MediaStream from microphone */
   private mediaStream: MediaStream | undefined;
 
-  /** ScriptProcessor for raw audio access */
-  private scriptProcessor: ScriptProcessorNode | undefined;
+  /** AudioWorklet node that streams PCM data off the audio thread */
+  private captureWorklet: AudioWorkletNode | undefined;
+
+  /** Silent sink to keep the capture graph alive without audible feedback */
+  private captureSink: GainNode | undefined;
 
   /** Source node from microphone */
   private sourceNode: MediaStreamAudioSourceNode | undefined;
@@ -144,6 +153,12 @@ export class AudioHandler {
         sampleRate: this.config.inputSampleRate
       });
 
+      if (!this.captureContext.audioWorklet) {
+        throw new Error(
+          "AudioWorklet is not supported in this browser. Please update to a modern browser to use voice capture."
+        );
+      }
+
       // Create source node from microphone stream
       this.sourceNode = this.captureContext.createMediaStreamSource(this.mediaStream);
 
@@ -152,23 +167,28 @@ export class AudioHandler {
       this.analyserNode.fftSize = 256;
       this.analyserNode.smoothingTimeConstant = 0.8;
 
-      // Create ScriptProcessor for raw PCM access
-      // Note: ScriptProcessorNode is deprecated but still widely supported
-      // AudioWorklet would be the modern alternative but adds complexity
-      this.scriptProcessor = this.captureContext.createScriptProcessor(4096, 1, 1);
-
-      this.scriptProcessor.onaudioprocess = (event: AudioProcessingEvent) => {
+      // Create AudioWorkletNode for low-latency PCM capture
+      this.captureWorklet = await this.createCaptureWorklet(this.captureContext);
+      this.captureWorklet.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
         if (!this.isCapturing) return;
+        const messageData = event.data;
 
-        const inputData = event.inputBuffer.getChannelData(0);
-        const pcmData = this.float32ToPCM16(inputData);
-        this.config.onAudioData(pcmData.buffer as ArrayBuffer);
+        if (messageData instanceof ArrayBuffer) {
+          this.config.onAudioData(messageData);
+        } else {
+          console.warn("[AudioHandler] Received unexpected message from worklet");
+        }
       };
 
-      // Connect the audio graph: microphone -> analyser -> processor -> destination
+      // Silent sink to keep the processing graph alive without audible feedback
+      this.captureSink = this.captureContext.createGain();
+      this.captureSink.gain.value = 0;
+
+      // Connect the audio graph: microphone -> analyser -> worklet -> silent sink -> destination
       this.sourceNode.connect(this.analyserNode);
-      this.analyserNode.connect(this.scriptProcessor);
-      this.scriptProcessor.connect(this.captureContext.destination);
+      this.analyserNode.connect(this.captureWorklet);
+      this.captureWorklet.connect(this.captureSink);
+      this.captureSink.connect(this.captureContext.destination);
 
       this.isCapturing = true;
       this.config.onCaptureStart?.();
@@ -201,10 +221,15 @@ export class AudioHandler {
     this.stopLevelMonitor();
 
     // Disconnect and cleanup nodes
-    if (this.scriptProcessor) {
-      this.scriptProcessor.disconnect();
-      this.scriptProcessor.onaudioprocess = null;
-      this.scriptProcessor = undefined;
+    if (this.captureWorklet) {
+      this.captureWorklet.port.onmessage = null;
+      this.captureWorklet.disconnect();
+      this.captureWorklet = undefined;
+    }
+
+    if (this.captureSink) {
+      this.captureSink.disconnect();
+      this.captureSink = undefined;
     }
 
     if (this.analyserNode) {
@@ -364,22 +389,68 @@ export class AudioHandler {
   }
 
   /**
-   * Converts Float32 audio samples to 16-bit PCM.
+   * Registers (once per AudioContext) and instantiates the AudioWorklet node that captures PCM16.
    *
-   * @param float32Array - Float32 samples (-1 to 1 range)
-   * @returns Int16Array of PCM samples
+   * @param context - AudioContext used for microphone capture
+   * @returns Configured AudioWorkletNode ready to receive microphone input
    */
-  private float32ToPCM16(float32Array: Float32Array): Int16Array {
-    const pcm16 = new Int16Array(float32Array.length);
+  private async createCaptureWorklet(context: AudioContext): Promise<AudioWorkletNode> {
+    const moduleUrl = AudioHandler.getOrCreateWorkletModuleUrl();
 
-    for (let i = 0; i < float32Array.length; i++) {
-      // Clamp to -1 to 1 range
-      const sample = Math.max(-1, Math.min(1, float32Array[i]));
-      // Convert to 16-bit integer
-      pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    if (!AudioHandler.registeredCaptureContexts.has(context)) {
+      await context.audioWorklet.addModule(moduleUrl);
+      AudioHandler.registeredCaptureContexts.add(context);
     }
 
-    return pcm16;
+    return new AudioWorkletNode(context, "pcm-capture-processor", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      channelCount: 1
+    });
+  }
+
+  /**
+   * Lazily builds a Blob URL for the capture AudioWorklet processor script.
+   *
+   * The processor converts Float32 audio frames to 16-bit PCM on the audio thread
+   * and posts the ArrayBuffer back to the main thread to avoid blocking UI work.
+   *
+   * @returns Blob URL that can be passed to `audioWorklet.addModule`
+   */
+  private static getOrCreateWorkletModuleUrl(): string {
+    if (!AudioHandler.workletModuleUrl) {
+      const workletSource = `
+        class PcmCaptureProcessor extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0];
+            if (!input || input.length === 0) {
+              return true;
+            }
+
+            const channelData = input[0];
+            const pcmBuffer = new ArrayBuffer(channelData.length * 2);
+            const view = new DataView(pcmBuffer);
+
+            for (let i = 0; i < channelData.length; i++) {
+              const sample = Math.max(-1, Math.min(1, channelData[i]));
+              const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+              view.setInt16(i * 2, intSample, true);
+            }
+
+            this.port.postMessage(pcmBuffer, [pcmBuffer]);
+            return true;
+          }
+        }
+
+        registerProcessor("pcm-capture-processor", PcmCaptureProcessor);
+      `;
+
+      const workletBlob = new Blob([workletSource], { type: "application/javascript" });
+      AudioHandler.workletModuleUrl = URL.createObjectURL(workletBlob);
+    }
+
+    return AudioHandler.workletModuleUrl;
   }
 
   /**
