@@ -240,3 +240,8 @@
 .gm-style-cc:hover {
   opacity: 1;
 }
+
+button,
+a {
+  cursor: pointer !important;
+}
